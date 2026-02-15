@@ -11,25 +11,25 @@
 //## USER CONFIG
 
 // Network (static)
-static byte MAC_ADDR[]    = { 0xDE, 0xAD, 0xBE, 0xEF, 0xBE, 0xEF };
-static IPAddress IP_ADDR(10, 23, 42, 05);
+static byte MAC_ADDR[]    = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFF, 0xEF };
+static IPAddress IP_ADDR(10, 22, 5, 10);
 static IPAddress SUBNET(255, 255, 255, 0);
-static IPAddress GATEWAY(10, 23, 42, 1);
-static IPAddress DNS_ADDR(10, 23, 42, 1);
+static IPAddress GATEWAY(10, 22, 5, 1);
+static IPAddress DNS_ADDR(10, 22, 5, 1);
 
 // MQTT broker
 static IPAddress MQTT_HOST(10, 22, 5, 5);
 static const uint16_t MQTT_PORT = 1883;
-static const char* MQTT_USER = "";
+static const char* MQTT_USER = "mqtt";
 static const char* MQTT_PASS = "";
 
 // HA device identification
 static const char* NODE_ID     = "garagecontroller01";
 static const char* DEVICE_NAME = "Garage Door Controller";
-static const char* SW_VERSION  = "1.0";
+static const char* SW_VERSION  = "1.1";
 
 // Sensors enable/disable
-static const bool DISABLE_EXTERNAL_SENSORS      = true; // If you don't have any external sensors, set to true
+static const bool DISABLE_EXTERNAL_SENSORS      = false; // If you don't have any external sensors, set to true
 
 // Timings
 static const uint32_t DOOR_MAX_MOVEMENT_MS      = 30000;
@@ -41,6 +41,12 @@ static const uint16_t BLINK_MS                  = 300;
 // MQTT Publishing
 static const uint32_t STATE_REFRESH_MS          = 60000;
 static const uint32_t MQTT_RECONNECT_MIN_MS     = 5000;
+
+// After endstop triggers, keep running for a short time (mechanical slack)
+static const uint16_t CLOSED_ENDSTOP_OVERRUN_MS = 1000; // adjust (e.g. 300..1500 ms)
+
+static bool closedOverrunActive = false;
+static uint32_t closedOverrunUntilMs = 0;
 
 //## I/O mapping (Controllino Maxi)
 
@@ -125,6 +131,17 @@ static bool hasClosedSensor() { return (!DISABLE_EXTERNAL_SENSORS) && (PIN_ENDST
 static bool hasOpenSensor()   { return (!DISABLE_EXTERNAL_SENSORS) && (PIN_ENDSTOP_OPEN   >= 0); }
 static bool hasCurtain()      { return (!DISABLE_EXTERNAL_SENSORS) && (PIN_LIGHT_CURTAIN  >= 0); }
 
+static void startClosedOverrun() {
+  closedOverrunActive = true;
+  closedOverrunUntilMs = millis() + CLOSED_ENDSTOP_OVERRUN_MS;
+}
+
+static void cancelClosedOverrun() {
+  closedOverrunActive = false;
+  closedOverrunUntilMs = 0;
+}
+
+
 static void buildTopics() {
   snprintf(topicBase, sizeof(topicBase), "homea/%s", NODE_ID);
   snprintf(topicCmd, sizeof(topicCmd), "%s/cmd", topicBase);
@@ -194,29 +211,31 @@ static void readSensors() {
 
 // The DOOR CONTROL Logic
 
-
 static void stopMotion() {
-  allRelaysOff();                 // <- to save energy: BOTH relays off when not moving
+  allRelaysOff();              // <- to save energy: BOTH relays off when not moving
   doorMoving = false;
   doorState = STOPPED;
   lastDoorStateChangeMs = millis();
+  cancelClosedOverrun();
 }
+
 
 static void armStart(DoorState startState) {
   // startState is START_OPEN or START_CLOSE
+  cancelClosedOverrun();
   doorState = startState;
   doorMoving = true;
   doorStartMs = millis();
   lastDoorStateChangeMs = doorStartMs;
-
   // keep direction asserted for the whole movement
   if (startState == START_OPEN)  setDirectionOpen();
   else                          setDirectionClose();
-
   // but keep POWER off until delay elapsed
   powerOff();
   relayArmMs = doorStartMs + RELAY_START_DELAY_MS;
 }
+
+
 
 static void commandOpen() {
   lastStartWasOpen = true;
@@ -292,12 +311,31 @@ static void enforceSafety() {
     return;
   }
 
-  // stop if closing and closed endstop hits
-  if ((doorState == CLOSING || doorState == START_CLOSE) && hasClosedSensor() && closedEndstopActive) {
-    stopMotion();
-    doorState = IDLE;
-    return;
+ // stop if closing and closed endstop hits -> but allow a short run-on
+if ((doorState == CLOSING || doorState == START_CLOSE) && hasClosedSensor() && closedEndstopActive) {
+  if (!closedOverrunActive && CLOSED_ENDSTOP_OVERRUN_MS > 0) {
+    startClosedOverrun();         // first time we see it: arm the run-on
+    return;                       // keep moving for now
   }
+
+  // if run-on time elapsed -> stop
+  if (closedOverrunActive) {
+    uint32_t now = millis();
+    if ((int32_t)(now - closedOverrunUntilMs) >= 0) {
+      stopMotion();
+      doorState = IDLE;
+      return;
+    } else {
+      return; // still within run-on window, keep going
+    }
+  }
+
+  // fallback (if overrun disabled)
+  stopMotion();
+  doorState = IDLE;
+  return;
+}
+
 
   // stop if opening and open endstop hits
   if ((doorState == OPENING || doorState == START_OPEN) && hasOpenSensor() && openEndstopActive) {
