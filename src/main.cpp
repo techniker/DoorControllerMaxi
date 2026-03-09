@@ -53,6 +53,9 @@ static uint32_t closedOverrunUntilMs = 0;
 // Local toggle input
 static const int PIN_LOCAL_BUTTON     = CONTROLLINO_A9;
 
+// Transponder input (dormakaba, normally-open relay, 2 s pulse, active LOW)
+static const int PIN_TRANSPONDER      = CONTROLLINO_A5;
+
 // Relays
 static const int PIN_DOOR_POWER_RELAY = CONTROLLINO_RELAY_08;
 static const int PIN_DOOR_DIR_RELAY   = CONTROLLINO_RELAY_09;
@@ -97,6 +100,7 @@ static bool openEndstopActive   = false;
 static bool obstructionActive   = false;
 
 static Bounce debouncer;
+static Bounce dormaKabaEvoloDebouncer;
 
 static uint32_t lastBlinkMs = 0;
 static bool blinkOn = false;
@@ -251,6 +255,19 @@ static void commandClose() {
 }
 
 
+
+// DormaKaba Evolo transponder trigger: open or close based on door state, never stop
+static void commandDormaKabaEvolo() {
+  // Closed endstop is definitive: door is closed -> open it
+  if (hasClosedSensor() && closedEndstopActive) { commandOpen(); return; }
+
+  // Use current movement direction to decide: reverse it
+  if (doorState == OPENING || doorState == START_OPEN)   { commandClose(); return; }
+  if (doorState == CLOSING || doorState == START_CLOSE)  { commandOpen();  return; }
+
+  // Stopped or idle (possibly mid-travel): alternate based on last start direction
+  if (lastStartWasOpen) { commandClose(); } else { commandOpen(); }
+}
 
 static void commandToggle() {
   // 1) If currently moving -> STOP
@@ -686,6 +703,11 @@ void setup() {
   debouncer.attach(PIN_LOCAL_BUTTON);
   debouncer.interval(DEBOUNCE_MS);
 
+  // DormaKaba Evolo transponder input (NO relay, active LOW via INPUT_PULLUP)
+  pinMode(PIN_TRANSPONDER, INPUT_PULLUP);
+  dormaKabaEvoloDebouncer.attach(PIN_TRANSPONDER);
+  dormaKabaEvoloDebouncer.interval(DEBOUNCE_MS);
+
   // Sensors
   if (!DISABLE_EXTERNAL_SENSORS) {
     if (PIN_ENDSTOP_CLOSED >= 0) pinMode(PIN_ENDSTOP_CLOSED, INPUT);
@@ -729,6 +751,13 @@ void loop() {
     }
   }
   lastBtn = btn;
+
+  // DormaKaba Evolo transponder (falling edge = relay closed = triggered)
+  dormaKabaEvoloDebouncer.update();
+  if (dormaKabaEvoloDebouncer.fell()) {
+    commandDormaKabaEvolo();
+    publishStates(true);
+  }
 
   // Sensors + safety
   readSensors();
