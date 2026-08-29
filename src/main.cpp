@@ -20,13 +20,13 @@ static IPAddress DNS_ADDR(10, 22, 5, 1);
 // MQTT broker
 static IPAddress MQTT_HOST(10, 22, 5, 5);
 static const uint16_t MQTT_PORT = 1883;
-static const char* MQTT_USER = "mqtt";
+static const char* MQTT_USER = "garage";
 static const char* MQTT_PASS = "";
 
 // HA device identification
 static const char* NODE_ID     = "garagecontroller01";
 static const char* DEVICE_NAME = "Garage Door Controller";
-static const char* SW_VERSION  = "1.1";
+static const char* SW_VERSION  = "1.2";
 
 // Sensors enable/disable
 static const bool DISABLE_EXTERNAL_SENSORS      = false; // If you don't have any external sensors, set to true
@@ -37,6 +37,7 @@ static const uint16_t RELAY_START_DELAY_MS      = 500;
 static const uint16_t DEBOUNCE_MS               = 50;
 static const uint16_t LOCAL_TOGGLE_GUARD_MS     = 1000;
 static const uint16_t BLINK_MS                  = 300;
+static const uint32_t LIGHT_AUTO_OFF_MS         = 60000; // garage light off 1 min after door stops
 
 // MQTT Publishing
 static const uint32_t STATE_REFRESH_MS          = 60000;
@@ -59,6 +60,7 @@ static const int PIN_TRANSPONDER      = CONTROLLINO_A5;
 // Relays
 static const int PIN_DOOR_POWER_RELAY = CONTROLLINO_RELAY_08;
 static const int PIN_DOOR_DIR_RELAY   = CONTROLLINO_RELAY_09;
+static const int PIN_GARAGE_LIGHT     = CONTROLLINO_RELAY_00; // LED garage light
 
 // Status outputs
 static const int PIN_STATUS_LIGHT     = CONTROLLINO_D11; // blinking while moving, ON idle
@@ -76,6 +78,13 @@ static const int LIGHT_CURTAIN_ACTIVE_LEVEL  = LOW;
 
 static bool lastToggleWantedOpen = true;
 static bool lastStartWasOpen = false; // last START direction
+
+// Garage light
+static bool lightOn         = false;
+static bool lightFromDoor   = false; // true when the door movement switched it on
+static bool lightTimerArmed = false;
+static uint32_t lightOffAtMs = 0;
+static bool lastDoorMoving  = false; // edge detector for door movement
 
 
 
@@ -121,12 +130,15 @@ static char topicAvail[128];
 static char topicClosedBin[128];
 static char topicOpenBin[128];
 static char topicObstBin[128];
+static char topicLightCmd[128];
+static char topicLightState[128];
 
 // Publish tracking
 static char lastCoverState[16] = {0};
 static bool lastClosedBin = false;
 static bool lastOpenBin   = false;
 static bool lastObstBin   = false;
+static bool lastLightOn   = false;
 static uint32_t lastStatePublishMs = 0;
 
 // little helpers
@@ -155,6 +167,9 @@ static void buildTopics() {
   snprintf(topicClosedBin, sizeof(topicClosedBin), "%s/bin/closed", topicBase);
   snprintf(topicOpenBin,   sizeof(topicOpenBin),   "%s/bin/open", topicBase);
   snprintf(topicObstBin,   sizeof(topicObstBin),   "%s/bin/obstruction", topicBase);
+
+  snprintf(topicLightCmd,   sizeof(topicLightCmd),   "%s/light/cmd", topicBase);
+  snprintf(topicLightState, sizeof(topicLightState), "%s/light/state", topicBase);
 }
 
 static void mqttPublish(const char* topic, const char* payload, bool retain=true) {
@@ -371,6 +386,53 @@ static void enforceTimeout() {
 }
 
 
+// GARAGE LIGHT
+
+
+// fromDoor=false marks a manual switch-on: it is sticky and disarms the timer.
+static void setLight(bool on, bool fromDoor) {
+  lightOn = on;
+  digitalWrite(PIN_GARAGE_LIGHT, on ? HIGH : LOW);
+  lightFromDoor = on ? fromDoor : false;
+  lightTimerArmed = false;
+  lightOffAtMs = 0;
+}
+
+static void commandLightToggle() {
+  setLight(!lightOn, false);
+}
+
+static uint32_t lightRemainingMs() {
+  if (!lightTimerArmed) return 0;
+  int32_t d = (int32_t)(lightOffAtMs - millis());
+  return (d > 0) ? (uint32_t)d : 0;
+}
+
+static void tickLight() {
+  uint32_t now = millis();
+
+  // Door started moving: switch on (edge-triggered, so a manual OFF during
+  // travel is not overwritten on the next loop pass).
+  if (doorMoving && !lastDoorMoving) {
+    if (!lightOn) setLight(true, true);   // door owns it -> auto-off later
+    else          lightTimerArmed = false; // already on manually -> stays sticky
+  }
+
+  // Door stopped: arm auto-off only if the door was the one that switched it on.
+  if (!doorMoving && lastDoorMoving) {
+    if (lightOn && lightFromDoor) {
+      lightTimerArmed = true;
+      lightOffAtMs = now + LIGHT_AUTO_OFF_MS;
+    }
+  }
+  lastDoorMoving = doorMoving;
+
+  if (lightTimerArmed && (int32_t)(now - lightOffAtMs) >= 0) {
+    setLight(false, false);
+  }
+}
+
+
 // HOME ASSISTANT DISCOVERY
 
 
@@ -444,6 +506,31 @@ static void publishDiscovery() {
   publishButton("stop",   "Garage Stop",   uidStop,   "STOP");
   publishButton("toggle", "Garage Toggle", uidToggle, "TOGGLE");
 
+  // Light
+  {
+    char t[180];
+    snprintf(t, sizeof(t), "homeassistant/light/%s/garage_light/config", NODE_ID);
+
+    char payload[760];
+    snprintf(payload, sizeof(payload),
+      "{"
+        "\"name\":\"Garage Light\","
+        "\"unique_id\":\"%s_light\","
+        "\"availability_topic\":\"%s\","
+        "\"state_topic\":\"%s\","
+        "\"command_topic\":\"%s\","
+        "\"payload_on\":\"ON\","
+        "\"payload_off\":\"OFF\","
+        "\"optimistic\":false,"
+        "\"qos\":1,"
+        "\"retain\":true,"
+        "\"device\":%s"
+      "}",
+      NODE_ID, topicAvail, topicLightState, topicLightCmd, dev
+    );
+    mqttPublish(t, payload, true);
+  }
+
   // Binary sensors
   auto publishBinary = [&](const char* objectId, const char* name, const char* unique, const char* stateTopic) {
     char t[220];
@@ -492,11 +579,12 @@ static void publishStates(bool force=false) {
   bool clChanged = (lastClosedBin != closedEndstopActive);
   bool opChanged = (lastOpenBin   != openEndstopActive);
   bool obChanged = (lastObstBin   != obstructionActive);
+  bool liChanged = (lastLightOn   != lightOn);
 
   uint32_t now = millis();
   bool timeRefresh = (now - lastStatePublishMs >= STATE_REFRESH_MS);
 
-  if (!force && !timeRefresh && !stChanged && !clChanged && !opChanged && !obChanged) return;
+  if (!force && !timeRefresh && !stChanged && !clChanged && !opChanged && !obChanged && !liChanged) return;
 
   mqttPublish(topicState, st, true);
 
@@ -504,12 +592,15 @@ static void publishStates(bool force=false) {
   if (hasOpenSensor())   mqttPublish(topicOpenBin,   openEndstopActive   ? "ON" : "OFF", true);
   if (hasCurtain())      mqttPublish(topicObstBin,   obstructionActive   ? "ON" : "OFF", true);
 
+  mqttPublish(topicLightState, lightOn ? "ON" : "OFF", true);
+
   // update cache
   strncpy(lastCoverState, st, sizeof(lastCoverState));
   lastCoverState[sizeof(lastCoverState)-1] = 0;
   lastClosedBin = closedEndstopActive;
   lastOpenBin   = openEndstopActive;
   lastObstBin   = obstructionActive;
+  lastLightOn   = lightOn;
   lastStatePublishMs = now;
 }
 
@@ -517,7 +608,9 @@ static void publishStates(bool force=false) {
 
 
 static void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  if (strcmp(topic, topicCmd) != 0) return;
+  bool isDoorCmd  = (strcmp(topic, topicCmd)      == 0);
+  bool isLightCmd = (strcmp(topic, topicLightCmd) == 0);
+  if (!isDoorCmd && !isLightCmd) return;
 
   char cmd[16];
   unsigned int n = (length < sizeof(cmd)-1) ? length : (sizeof(cmd)-1);
@@ -528,10 +621,16 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (cmd[i] >= 'a' && cmd[i] <= 'z') cmd[i] = char(cmd[i] - 32);
   }
 
-  if      (strcmp(cmd, "OPEN")   == 0) commandOpen();
-  else if (strcmp(cmd, "CLOSE")  == 0) commandClose();
-  else if (strcmp(cmd, "STOP")   == 0) stopMotion();
-  else if (strcmp(cmd, "TOGGLE") == 0) commandToggle();
+  if (isDoorCmd) {
+    if      (strcmp(cmd, "OPEN")   == 0) commandOpen();
+    else if (strcmp(cmd, "CLOSE")  == 0) commandClose();
+    else if (strcmp(cmd, "STOP")   == 0) stopMotion();
+    else if (strcmp(cmd, "TOGGLE") == 0) commandToggle();
+  } else {
+    if      (strcmp(cmd, "ON")     == 0) setLight(true,  false);
+    else if (strcmp(cmd, "OFF")    == 0) setLight(false, false);
+    else if (strcmp(cmd, "TOGGLE") == 0) commandLightToggle();
+  }
 
   publishStates(true);
 }
@@ -554,6 +653,7 @@ static void mqttEnsureConnected() {
 
   if (ok) {
     mqtt.subscribe(topicCmd, 1);
+    mqtt.subscribe(topicLightCmd, 1);
     mqttPublish(topicAvail, "online", true);
 
     // publish discovery once on boot + once on each successful MQTT connect
@@ -573,53 +673,71 @@ static void mqttEnsureConnected() {
 
 
 static void httpSend(EthernetClient& c) {
-  c.println("HTTP/1.1 200 OK");
-  c.println("Content-Type: text/html; charset=utf-8");
-  c.println("Connection: close");
+  c.println(F("HTTP/1.1 200 OK"));
+  c.println(F("Content-Type: text/html; charset=utf-8"));
+  c.println(F("Connection: close"));
   c.println();
 
   const char* st = coverState();
 
-  c.println("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>");
-  c.println("<title>Garage Door</title><style>");
-  c.println("body{margin:0;font-family:Arial;background:#222;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;}");
-  c.println(".wrap{width:min(520px,92vw);text-align:center;}");
-  c.println("h1{font-size:22px;margin:8px 0 18px 0;font-weight:600;}");
-  c.println(".btn{width:100%;padding:18px 14px;margin:8px 0;font-size:20px;border:0;border-radius:14px;background:#444;color:#fff;}");
-  c.println(".row{display:flex;gap:10px;}");
-  c.println(".row .btn{width:100%;}");
-  c.println(".card{background:#2d2d2d;border-radius:14px;padding:14px;margin-top:14px;text-align:left;}");
-  c.println(".dot{display:inline-block;width:14px;height:14px;border-radius:50%;margin-right:10px;vertical-align:middle;}");
-  c.println(".ok{background:#00c853}.bad{background:#ff1744}.warn{background:#ffab00}");
-  c.println("</style></head><body><div class='wrap'>");
+  c.println(F("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>"));
+  c.println(F("<title>Garage Door</title><style>"));
+  c.println(F("body{margin:0;font-family:Arial;background:#222;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;}"));
+  c.println(F(".wrap{width:min(520px,92vw);text-align:center;}"));
+  c.println(F("h1{font-size:22px;margin:8px 0 18px 0;font-weight:600;}"));
+  c.println(F(".btn{width:100%;padding:18px 14px;margin:8px 0;font-size:20px;border:0;border-radius:14px;background:#444;color:#fff;}"));
+  c.println(F(".row{display:flex;gap:10px;}"));
+  c.println(F(".row .btn{width:100%;}"));
+  c.println(F(".card{background:#2d2d2d;border-radius:14px;padding:14px;margin-top:14px;text-align:left;}"));
+  c.println(F(".dot{display:inline-block;width:14px;height:14px;border-radius:50%;margin-right:10px;vertical-align:middle;}"));
+  c.println(F(".ok{background:#00c853}.bad{background:#ff1744}.warn{background:#ffab00}"));
+  c.println(F("</style></head><body><div class='wrap'>"));
 
-  c.println("<h1>Garage Door Controller</h1>");
-  c.println("<div class='row'>");
-  c.println("<button class='btn' onclick=\"location.href='/open'\">Open</button>");
-  c.println("<button class='btn' onclick=\"location.href='/close'\">Close</button>");
-  c.println("</div>");
-  c.println("<button class='btn' onclick=\"location.href='/stop'\">Stop</button>");
-  c.println("<button class='btn' onclick=\"location.href='/toggle'\">Toggle</button>");
+  c.println(F("<h1>Garage Door Controller</h1>"));
+  c.println(F("<div class='row'>"));
+  c.println(F("<button class='btn' onclick=\"location.href='/open'\">Open</button>"));
+  c.println(F("<button class='btn' onclick=\"location.href='/close'\">Close</button>"));
+  c.println(F("</div>"));
+  c.println(F("<button class='btn' onclick=\"location.href='/stop'\">Stop</button>"));
+  c.println(F("<button class='btn' onclick=\"location.href='/toggle'\">Toggle</button>"));
+  c.println(F("<div class='row'>"));
+  c.println(F("<button class='btn' onclick=\"location.href='/light/on'\">Light On</button>"));
+  c.println(F("<button class='btn' onclick=\"location.href='/light/off'\">Light Off</button>"));
+  c.println(F("</div>"));
 
-  c.println("<div class='card'>");
+  c.println(F("<div class='card'>"));
 
-  c.print("<div><span class='dot ");
-  if (doorMoving) c.print("warn");
-  else if (hasClosedSensor() && closedEndstopActive) c.print("ok");
-  else c.print("bad");
-  c.print("'></span>Status: ");
+  c.print(F("<div><span class='dot "));
+  if (doorMoving) c.print(F("warn"));
+  else if (hasClosedSensor() && closedEndstopActive) c.print(F("ok"));
+  else c.print(F("bad"));
+  c.print(F("'></span>Status: "));
   c.print(st);
-  c.println("</div>");
+  c.println(F("</div>"));
 
-  c.print("<div style='margin-top:8px;'>Closed endstop: ");
+  c.print(F("<div style='margin-top:8px;'>Closed endstop: "));
   c.print(hasClosedSensor() ? (closedEndstopActive ? "ACTIVE" : "inactive") : "disabled");
-  c.println("</div>");
+  c.println(F("</div>"));
 
-  c.print("<div style='margin-top:8px;'>Light curtain: ");
+  c.print(F("<div style='margin-top:8px;'>Light curtain: "));
   c.print(hasCurtain() ? (obstructionActive ? "OBSTRUCTION" : "clear") : "disabled");
-  c.println("</div>");
+  c.println(F("</div>"));
 
-  c.println("</div></div></body></html>");
+  c.print(F("<div style='margin-top:8px;'>Garage light: "));
+  if (lightOn) {
+    c.print(F("ON"));
+    uint32_t rem = lightRemainingMs();
+    if (rem > 0) {
+      c.print(F(" (auto-off in "));
+      c.print((rem + 999) / 1000);
+      c.print(F("s)"));
+    }
+  } else {
+    c.print(F("OFF"));
+  }
+  c.println(F("</div>"));
+
+  c.println(F("</div></div></body></html>"));
 }
 
 static void httpHandle() {
@@ -647,6 +765,9 @@ static void httpHandle() {
   else if (strncmp(reqLine, "GET /close", 10) == 0) commandClose();
   else if (strncmp(reqLine, "GET /stop",   9) == 0) stopMotion();
   else if (strncmp(reqLine, "GET /toggle",11) == 0) commandToggle();
+  else if (strncmp(reqLine, "GET /light/toggle",17) == 0) commandLightToggle();
+  else if (strncmp(reqLine, "GET /light/on",13) == 0) setLight(true,  false);
+  else if (strncmp(reqLine, "GET /light/off",14) == 0) setLight(false, false);
 
   httpSend(client);
   client.stop();
@@ -691,10 +812,12 @@ void setup() {
   // Outputs
   pinMode(PIN_DOOR_POWER_RELAY, OUTPUT);
   pinMode(PIN_DOOR_DIR_RELAY, OUTPUT);
+  pinMode(PIN_GARAGE_LIGHT, OUTPUT);
   pinMode(PIN_STATUS_LIGHT, OUTPUT);
   pinMode(PIN_STATUS_LOCKED, OUTPUT);
 
-  allRelaysOff(); // <- both off at boot
+  allRelaysOff(); // <- both door relays off at boot
+  digitalWrite(PIN_GARAGE_LIGHT, LOW); // light relay is NOT touched by allRelaysOff()
   digitalWrite(PIN_STATUS_LIGHT, LOW);
   digitalWrite(PIN_STATUS_LOCKED, LOW);
 
@@ -764,6 +887,9 @@ void loop() {
   tickRelayStart();
   enforceSafety();
   enforceTimeout();
+
+  // Garage light (door-movement edge + auto-off timer)
+  tickLight();
 
   // MQTT
   mqttEnsureConnected();
